@@ -103,6 +103,49 @@ class FeedbackSoir(BaseModel):
     note_rlhf:        Optional[int] = None   # 1-5, optionnel
     energie_ressentie: Optional[int] = 3     # 1-5
 
+# Ajoute après les imports Pydantic existants
+
+class ProjetConfig(BaseModel):
+    nom:           str
+    type:          int   # 0=Cognitif, 1=Physique, 2=Social, 3=Admin
+    charge_totale: int   # nombre de créneaux (1 créneau = 30 min)
+    deadline:      int   # jour 1-30
+
+class CreneauFixe(BaseModel):
+    debut: int   # slot 0-27
+    duree: int   # en créneaux
+    type:  int   # type de tâche
+
+class ConfigurationRequest(BaseModel):
+    projets:               List[ProjetConfig]
+    planning_fixe:         dict[str, List[CreneauFixe]]  # "0"=lundi .. "6"=dim
+    objectif_sport:        int   # créneaux/semaine (ex: 20 = 10h)
+
+# Ajoute cette route
+@app.post("/configurer")
+def configurer(config: ConfigurationRequest):
+    global planificateur, plannings_du_mois
+
+    projets = [
+        {"nom": p.nom, "type": p.type, "charge_totale": p.charge_totale, "deadline": p.deadline}
+        for p in config.projets
+    ]
+
+    planning_fixe = {
+        int(jour): [(c.debut, c.duree, c.type) for c in creneaux]
+        for jour, creneaux in config.planning_fixe.items()
+    }
+
+    planificateur   = PlanificateurMensuel(projets, planning_fixe, config.objectif_sport)
+    plannings_du_mois = {}
+
+    return {
+        "message":        "Configuration appliquee !",
+        "nb_projets":     len(projets),
+        "objectif_sport": config.objectif_sport,
+        "etat":           planificateur.get_etat(),
+    }
+
 # ──────────────────────────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────────────────────────
