@@ -1,15 +1,5 @@
 """
-SmartDay API — FastAPI server
-Expose le DQN + PlanificateurMensuel via HTTP/JSON.
-
-Routes :
-  GET  /                        → statut du serveur
-  GET  /etat                    → état du mois en cours
-  POST /nouvelle-journee        → génère le planning du jour suivant
-  GET  /planning/{jour}         → récupère le planning d'un jour donné
-  POST /feedback-soir           → enregistre les tâches faites + note RLHF
-  GET  /dashboard               → stats complètes du mois
-  POST /reset                   → repart de zéro
+SmartDay API — FastAPI server V2
 """
 
 import os
@@ -26,37 +16,10 @@ from smartday import (
     PROFIL_BASE,
 )
 
-# ──────────────────────────────────────────────────────────────────
-# Configuration du mois (modifiable selon l'utilisateur)
-# ──────────────────────────────────────────────────────────────────
-
-PROJETS_DU_MOIS = [
-    {"nom": "Rapport IA",     "type": COGNITIF, "charge_totale": 20, "deadline": 20},
-    {"nom": "Projet Math",    "type": COGNITIF, "charge_totale": 12, "deadline": 12},
-    {"nom": "Presentation",   "type": SOCIAL,   "charge_totale":  8, "deadline": 18},
-    {"nom": "Emails & Admin", "type": ADMIN,    "charge_totale": 20, "deadline": 30},
-    {"nom": "Projet Perso",   "type": COGNITIF, "charge_totale": 10, "deadline": 28},
-]
-
-# Travail fixe : lundi-vendredi 8h00-10h00 (slots 0-3)
-PLANNING_FIXE = {
-    0: [(0, 4, COGNITIF)],
-    1: [(0, 4, COGNITIF)],
-    2: [(0, 4, COGNITIF)],
-    3: [(0, 4, COGNITIF)],
-    4: [(0, 4, COGNITIF)],
-}
-
-OBJECTIF_SPORT = 20  # créneaux/semaine = 10h
-
-# ──────────────────────────────────────────────────────────────────
-# Initialisation globale
-# ──────────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="SmartDay API",
     description="Planificateur journalier intelligent par Double DQN",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -71,26 +34,38 @@ agent = DQNAgent()
 MODEL_PATH = os.getenv("MODEL_PATH", "smartday_v5_best.pth")
 if os.path.exists(MODEL_PATH):
     agent.charger(MODEL_PATH)
-    print(f"Modèle chargé : {MODEL_PATH}")
 else:
-    print(f"ATTENTION : modèle {MODEL_PATH} introuvable — l'agent jouera de façon non entraînée")
+    print(f"ATTENTION : modèle {MODEL_PATH} introuvable")
 
-# Planificateur et stockage des plannings
+# État global
 planificateur: PlanificateurMensuel = None
-plannings_du_mois: dict = {}   # { jour: liste de tâches placées }
+plannings_du_mois: dict = {}
+creneaux_fixes_noms: dict = {}  # { (jour, debut): nom }
 
 
 def init_planificateur():
-    global planificateur, plannings_du_mois
-    planificateur   = PlanificateurMensuel(PROJETS_DU_MOIS, PLANNING_FIXE, OBJECTIF_SPORT)
-    plannings_du_mois = {}
+    global planificateur, plannings_du_mois, creneaux_fixes_noms
+    planificateur      = PlanificateurMensuel([], {}, 20)
+    plannings_du_mois  = {}
+    creneaux_fixes_noms = {}
 
 
 init_planificateur()
 
-# ──────────────────────────────────────────────────────────────────
-# Modèles Pydantic (schémas JSON)
-# ──────────────────────────────────────────────────────────────────
+# ── Modèles Pydantic ──────────────────────────────────────────────
+
+class ProjetConfig(BaseModel):
+    nom:           str
+    type:          int
+    charge_totale: int
+    deadline:      int
+
+class CreneauFixeConfig(BaseModel):
+    nom:         str
+    jour:        int
+    debut:       int
+    duree:       int
+    type:        int
 
 class TacheRealisee(BaseModel):
     projet_id: str
@@ -99,96 +74,130 @@ class TacheRealisee(BaseModel):
     debut:     int
 
 class FeedbackSoir(BaseModel):
-    taches_realisees: List[TacheRealisee]
-    note_rlhf:        Optional[int] = None   # 1-5, optionnel
-    energie_ressentie: Optional[int] = 3     # 1-5
+    taches_realisees:  List[TacheRealisee]
+    note_rlhf:         Optional[int] = None
+    energie_ressentie: Optional[int] = 3
 
-# Ajoute après les imports Pydantic existants
-
-class ProjetConfig(BaseModel):
-    nom:           str
-    type:          int   # 0=Cognitif, 1=Physique, 2=Social, 3=Admin
-    charge_totale: int   # nombre de créneaux (1 créneau = 30 min)
-    deadline:      int   # jour 1-30
-
-class CreneauFixe(BaseModel):
-    debut: int   # slot 0-27
-    duree: int   # en créneaux
-    type:  int   # type de tâche
-
-class ConfigurationRequest(BaseModel):
-    projets:               List[ProjetConfig]
-    planning_fixe:         dict[str, List[CreneauFixe]]  # "0"=lundi .. "6"=dim
-    objectif_sport:        int   # créneaux/semaine (ex: 20 = 10h)
-
-# Ajoute cette route
-@app.post("/configurer")
-def configurer(config: ConfigurationRequest):
-    global planificateur, plannings_du_mois
-
-    projets = [
-        {"nom": p.nom, "type": p.type, "charge_totale": p.charge_totale, "deadline": p.deadline}
-        for p in config.projets
-    ]
-
-    planning_fixe = {
-        int(jour): [(c.debut, c.duree, c.type) for c in creneaux]
-        for jour, creneaux in config.planning_fixe.items()
-    }
-
-    planificateur   = PlanificateurMensuel(projets, planning_fixe, config.objectif_sport)
-    plannings_du_mois = {}
-
-    return {
-        "message":        "Configuration appliquee !",
-        "nb_projets":     len(projets),
-        "objectif_sport": config.objectif_sport,
-        "etat":           planificateur.get_etat(),
-    }
-
-# ──────────────────────────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────
 
 @app.get("/")
 def racine():
     return {
-        "service":  "SmartDay API",
-        "version":  "1.0.0",
-        "jour":     planificateur.jour_actuel,
-        "modele":   MODEL_PATH if os.path.exists(MODEL_PATH) else "non charge",
+        "service": "SmartDay API",
+        "version": "2.0.0",
+        "jour":    planificateur.jour_actuel if planificateur else 0,
     }
 
 
 @app.get("/etat")
 def get_etat():
-    """Retourne l'état complet du mois : projets, sport, jour actuel."""
     return planificateur.get_etat()
+
+
+@app.post("/projets")
+def ajouter_projet(projet: ProjetConfig):
+    """Ajoute un projet sans écraser les existants."""
+    # Vérifier si le projet existe déjà
+    for p in planificateur.projets:
+        if p["nom"] == projet.nom:
+            raise HTTPException(status_code=400, detail=f"Le projet '{projet.nom}' existe déjà.")
+
+    planificateur.projets.append({
+        "nom":               projet.nom,
+        "type":              projet.type,
+        "charge_totale":     projet.charge_totale,
+        "creneaux_restants": projet.charge_totale,
+        "deadline":          projet.deadline,
+        "termine":           False,
+    })
+    return {"message": f"Projet '{projet.nom}' ajouté.", "etat": planificateur.get_etat()}
+
+
+@app.delete("/projets/{nom}")
+def supprimer_projet(nom: str):
+    """Supprime un projet par son nom."""
+    avant = len(planificateur.projets)
+    planificateur.projets = [p for p in planificateur.projets if p["nom"] != nom]
+    if len(planificateur.projets) == avant:
+        raise HTTPException(status_code=404, detail=f"Projet '{nom}' introuvable.")
+    return {"message": f"Projet '{nom}' supprimé.", "etat": planificateur.get_etat()}
+
+
+@app.post("/creneaux")
+def ajouter_creneau(creneau: CreneauFixeConfig):
+    """Ajoute un créneau fixe sans écraser les existants."""
+    jour = creneau.jour
+    if jour not in planificateur.planning_fixe:
+        planificateur.planning_fixe[jour] = []
+
+    planificateur.planning_fixe[jour].append((creneau.debut, creneau.duree, creneau.type))
+    creneaux_fixes_noms[(jour, creneau.debut)] = creneau.nom
+
+    return {"message": f"Créneau '{creneau.nom}' ajouté.", "etat": planificateur.get_etat()}
+
+
+@app.delete("/creneaux/{jour}/{debut}")
+def supprimer_creneau(jour: int, debut: int):
+    """Supprime un créneau fixe par jour et heure de début."""
+    if jour not in planificateur.planning_fixe:
+        raise HTTPException(status_code=404, detail="Créneau introuvable.")
+
+    avant = len(planificateur.planning_fixe[jour])
+    planificateur.planning_fixe[jour] = [
+        c for c in planificateur.planning_fixe[jour] if c[0] != debut
+    ]
+    if len(planificateur.planning_fixe[jour]) == avant:
+        raise HTTPException(status_code=404, detail="Créneau introuvable.")
+
+    creneaux_fixes_noms.pop((jour, debut), None)
+    return {"message": "Créneau supprimé.", "etat": planificateur.get_etat()}
+
+
+@app.get("/creneaux")
+def get_creneaux():
+    """Retourne tous les créneaux fixes avec leurs noms."""
+    result = []
+    for jour, liste in planificateur.planning_fixe.items():
+        for debut, duree, type_t in liste:
+            result.append({
+                "jour":      jour,
+                "debut":     debut,
+                "heure":     SLOT_LABELS[debut],
+                "duree":     duree,
+                "duree_min": duree * 30,
+                "type":      type_t,
+                "type_nom":  TYPE_NOMS[type_t],
+                "nom":       creneaux_fixes_noms.get((jour, debut), "Fixe"),
+            })
+    return {"creneaux": result}
+
+
+@app.post("/objectif-sport")
+def set_objectif_sport(objectif: int):
+    planificateur.objectif_sport_semaine = objectif
+    return {"message": f"Objectif sport mis à jour : {objectif} créneaux/semaine"}
 
 
 @app.post("/nouvelle-journee")
 def nouvelle_journee():
-    """
-    Génère et retourne le planning du jour suivant.
-    Le DQN place les tâches selon le profil énergie courant.
-    """
     if planificateur.jour_actuel >= 30:
-        raise HTTPException(status_code=400, detail="Le mois est terminé. Appelez /reset pour recommencer.")
+        raise HTTPException(status_code=400, detail="Le mois est terminé.")
 
-    jour = planificateur.jour_actuel
+    jour        = planificateur.jour_actuel
     taches_jour = planificateur.calculer_taches_du_jour()
 
     if not taches_jour:
-        return {
-            "jour":     jour + 1,
-            "message":  "Tous les projets sont terminés !",
-            "planning": [],
-            "etat":     planificateur.get_etat(),
-        }
+        return {"jour": jour + 1, "message": "Tous les projets sont terminés !", "planning": []}
 
-  # Variation quotidienne du profil energie
+    # Remplacer projet_id "fixe" par le vrai nom du créneau
+    jour_semaine = jour % 7
+    for t in taches_jour:
+        if t["est_fixee"]:
+            cle = (jour_semaine, t["creneau_fixe"])
+            t["projet_id"] = creneaux_fixes_noms.get(cle, "Fixe")
+
     profil_du_jour = planificateur.profil_energie.copy()
-    bruit = np.random.normal(0, 0.05, len(profil_du_jour))
+    bruit          = np.random.normal(0, 0.08, len(profil_du_jour))
     profil_du_jour = np.clip(profil_du_jour + bruit, 0.1, 1.0).astype("float32")
 
     env = SmartDayEnv(tasks=taches_jour, energy_profile=profil_du_jour)
@@ -202,52 +211,12 @@ def nouvelle_journee():
         action = agent.choisir_action(obs, env=env)
         obs, _, termine, _, _ = env.step(action)
 
-    # Sérialisation du planning
     planning_json = []
     for debut, duree, type_t, reward, projet_id in env.taches_placees:
         planning_json.append({
-            "debut":        debut,
-            "heure":        SLOT_LABELS[debut],
-            "fin": SLOT_LABELS[min(debut + duree, N_SLOTS - 1)],
-            "duree":        duree,
-            "duree_min":    duree * 30,
-            "type":         type_t,
-            "type_nom":     TYPE_NOMS[type_t],
-            "couleur":      TYPE_COULEURS[type_t],
-            "projet_id":    projet_id,
-            "reward":       round(reward, 3),
-        })
-
-    # Stockage pour /planning/{jour}
-    plannings_du_mois[jour] = {
-        "taches_placees": env.taches_placees,
-        "env":            env,
-    }
-
-    return {
-        "jour":          jour + 1,
-        "planning":      planning_json,
-        "nb_taches":     len(planning_json),
-        "taux_placement": round(len(planning_json) / len(taches_jour), 2),
-        "profil_energie": planificateur.profil_energie.tolist(),
-        "etat":           planificateur.get_etat(),
-    }
-
-
-@app.get("/planning/{jour}")
-def get_planning(jour: int):
-    """Récupère le planning d'un jour déjà calculé (1-indexé)."""
-    jour_0 = jour - 1
-    if jour_0 not in plannings_du_mois:
-        raise HTTPException(status_code=404, detail=f"Aucun planning trouvé pour le jour {jour}.")
-
-    data = plannings_du_mois[jour_0]
-    planning_json = []
-    for debut, duree, type_t, reward, projet_id in data["taches_placees"]:
-        planning_json.append({
             "debut":     debut,
             "heure":     SLOT_LABELS[debut],
-            "fin":       SLOT_LABELS[min(debut + duree - 1, N_SLOTS - 1)],
+            "fin":       SLOT_LABELS[min(debut + duree, N_SLOTS - 1)],
             "duree":     duree,
             "duree_min": duree * 30,
             "type":      type_t,
@@ -257,32 +226,31 @@ def get_planning(jour: int):
             "reward":    round(reward, 3),
         })
 
-    return {"jour": jour, "planning": planning_json}
+    plannings_du_mois[jour] = {"taches_placees": env.taches_placees, "env": env}
+
+    return {
+        "jour":           jour + 1,
+        "planning":       planning_json,
+        "nb_taches":      len(planning_json),
+        "taux_placement": round(len(planning_json) / max(len(taches_jour), 1), 2),
+        "profil_energie": profil_du_jour.tolist(),
+        "etat":           planificateur.get_etat(),
+    }
 
 
 @app.post("/feedback-soir")
 def feedback_soir(feedback: FeedbackSoir):
-    """
-    Enregistre les tâches réellement faites dans la journée.
-    Si note_rlhf est fournie (1-5), réentraîne l'agent avec RLHF.
-    """
     jour = planificateur.jour_actuel
-
-    # Conversion pour le planificateur
     taches_realisees = [
         (t.debut, t.duree, t.type_t, 0.0, t.projet_id)
         for t in feedback.taches_realisees
     ]
-
-    # Mise à jour du planificateur
     planificateur.feedback_soir(taches_realisees, feedback.energie_ressentie)
 
-    # RLHF si note fournie
     rlhf_applique = False
     if feedback.note_rlhf and feedback.note_rlhf in range(1, 6):
-        jour_0 = jour
-        if jour_0 in plannings_du_mois:
-            env = plannings_du_mois[jour_0]["env"]
+        if jour in plannings_du_mois:
+            env = plannings_du_mois[jour]["env"]
             agent.rlhf(env, feedback.note_rlhf)
             rlhf_applique = True
 
@@ -296,46 +264,54 @@ def feedback_soir(feedback: FeedbackSoir):
 
 @app.get("/dashboard")
 def dashboard():
-    """Stats complètes du mois en cours."""
-    historique = planificateur.historique
-
-    # Sport par semaine
-    sport_par_semaine = []
-    semaine_courante  = 0
+    historique         = planificateur.historique
+    sport_par_semaine  = []
     for h in historique:
         s = h["jour"] // 7
         while len(sport_par_semaine) <= s:
             sport_par_semaine.append(0)
         sport_par_semaine[s] += h["sport"]
 
-    # Scores journaliers
-    scores_journaliers = [
-        plannings_du_mois[j]["taches_placees"]
-        for j in sorted(plannings_du_mois)
-        if j in plannings_du_mois
-    ]
     scores = [
-        round(sum(r for _, _, _, r, _ in tp), 2)
-        for tp in scores_journaliers
+        round(sum(r for _, _, _, r, _ in plannings_du_mois[j]["taches_placees"]), 2)
+        for j in sorted(plannings_du_mois)
     ]
 
+    # Créneaux fixes formatés
+    creneaux_list = []
+    jours_noms = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+    for jour, liste in planificateur.planning_fixe.items():
+        for debut, duree, type_t in liste:
+            creneaux_list.append({
+                "jour":      jour,
+                "jour_nom":  jours_noms[jour],
+                "debut":     debut,
+                "heure":     SLOT_LABELS[debut],
+                "duree_min": duree * 30,
+                "type_nom":  TYPE_NOMS[type_t],
+                "nom":       creneaux_fixes_noms.get((jour, debut), "Fixe"),
+            })
+
     return {
-        "jour_actuel":      planificateur.jour_actuel,
-        "jours_restants":   30 - planificateur.jour_actuel,
-        "projets":          planificateur.get_etat()["projets"],
+        "jour_actuel":       planificateur.jour_actuel,
+        "jours_restants":    30 - planificateur.jour_actuel,
+        "projets":           planificateur.get_etat()["projets"],
+        "creneaux_fixes":    creneaux_list,
         "sport_par_semaine": [
-            {"semaine": i + 1, "creneaux": s, "heures": round(s * 30 / 60, 1),
-             "objectif_atteint": s >= OBJECTIF_SPORT}
+            {
+                "semaine":          i + 1,
+                "creneaux":         s,
+                "heures":           round(s * 30 / 60, 1),
+                "objectif_atteint": s >= planificateur.objectif_sport_semaine,
+            }
             for i, s in enumerate(sport_par_semaine)
         ],
         "scores_journaliers": scores,
         "score_moyen":        round(sum(scores) / len(scores), 2) if scores else 0,
-        "historique_energie": [h["energie"] for h in historique],
     }
 
 
 @app.post("/reset")
 def reset():
-    """Remet le mois à zéro — nouveau mois, nouveaux projets."""
     init_planificateur()
     return {"message": "Nouveau mois démarré !", "etat": planificateur.get_etat()}
