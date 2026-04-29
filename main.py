@@ -143,8 +143,12 @@ def nouvelle_journee():
             "etat":     planificateur.get_etat(),
         }
 
-    # L'agent place les tâches
-    env = SmartDayEnv(tasks=taches_jour, energy_profile=planificateur.profil_energie)
+  # Variation quotidienne du profil energie
+    profil_du_jour = planificateur.profil_energie.copy()
+    bruit = np.random.normal(0, 0.05, len(profil_du_jour))
+    profil_du_jour = np.clip(profil_du_jour + bruit, 0.1, 1.0).astype("float32")
+
+    env = SmartDayEnv(tasks=taches_jour, energy_profile=profil_du_jour)
     obs, _ = env.reset()
     termine = False
 
