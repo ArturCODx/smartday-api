@@ -208,7 +208,7 @@ def nouvelle_journee():
         planning_json.append({
             "debut":        debut,
             "heure":        SLOT_LABELS[debut],
-            "fin":          SLOT_LABELS[min(debut + duree - 1, N_SLOTS - 1)],
+            "fin": SLOT_LABELS[min(debut + duree, N_SLOTS - 1)],
             "duree":        duree,
             "duree_min":    duree * 30,
             "type":         type_t,
