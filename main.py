@@ -15,6 +15,12 @@ from smartday import (
     N_SLOTS, COGNITIF, PHYSIQUE, SOCIAL, ADMIN,
     PROFIL_BASE,
 )
+from smartday.database import (
+    init_db, charger_tout, reset_db,
+    sauvegarder_etat, sauvegarder_projets,
+    sauvegarder_creneaux, sauvegarder_historique,
+    sauvegarder_planning,
+)
 
 app = FastAPI(
     title="SmartDay API",
@@ -37,17 +43,55 @@ if os.path.exists(MODEL_PATH):
 else:
     print(f"ATTENTION : modèle {MODEL_PATH} introuvable")
 
-# État global
+# État global (cache en mémoire, persisté en base)
 planificateur: PlanificateurMensuel = None
 plannings_du_mois: dict = {}
-creneaux_fixes_noms: dict = {}  # { (jour, debut): nom }
+creneaux_fixes_noms: dict = {}
+
+
+class EnvSnapshot:
+    """Snapshot minimal d'un env pour le RLHF (taches_placees + historique_obs)."""
+    def __init__(self, taches_placees, historique_obs):
+        self.taches_placees = taches_placees
+        self.historique_obs = historique_obs
+
+
+def _sauvegarder_tout():
+    sauvegarder_etat(
+        planificateur.jour_actuel,
+        planificateur.bilan_sport_semaine,
+        planificateur.objectif_sport_semaine,
+        planificateur.profil_energie,
+    )
+    sauvegarder_projets(planificateur.projets)
+    sauvegarder_creneaux(planificateur.planning_fixe, creneaux_fixes_noms)
+    sauvegarder_historique(planificateur.historique)
 
 
 def init_planificateur():
     global planificateur, plannings_du_mois, creneaux_fixes_noms
-    planificateur      = PlanificateurMensuel([], {}, 20)
-    plannings_du_mois  = {}
-    creneaux_fixes_noms = {}
+    init_db()
+    data = charger_tout()
+
+    if data:
+        planificateur = PlanificateurMensuel([], data["planning_fixe"], data["objectif_sport"])
+        planificateur.projets             = data["projets"]
+        planificateur.jour_actuel         = data["jour_actuel"]
+        planificateur.bilan_sport_semaine = data["bilan_sport_semaine"]
+        planificateur.profil_energie      = data["profil_energie"]
+        planificateur.historique          = data["historique"]
+        creneaux_fixes_noms               = data["creneaux_noms"]
+        plannings_du_mois = {
+            jour: {
+                "taches_placees": snap["taches_placees"],
+                "env": EnvSnapshot(snap["taches_placees"], snap["historique_obs"]),
+            }
+            for jour, snap in data["plannings"].items()
+        }
+    else:
+        planificateur       = PlanificateurMensuel([], {}, 20)
+        plannings_du_mois   = {}
+        creneaux_fixes_noms = {}
 
 
 init_planificateur()
@@ -97,7 +141,6 @@ def get_etat():
 @app.post("/projets")
 def ajouter_projet(projet: ProjetConfig):
     """Ajoute un projet sans écraser les existants."""
-    # Vérifier si le projet existe déjà
     for p in planificateur.projets:
         if p["nom"] == projet.nom:
             raise HTTPException(status_code=400, detail=f"Le projet '{projet.nom}' existe déjà.")
@@ -110,6 +153,13 @@ def ajouter_projet(projet: ProjetConfig):
         "deadline":          projet.deadline,
         "termine":           False,
     })
+    sauvegarder_etat(
+        planificateur.jour_actuel,
+        planificateur.bilan_sport_semaine,
+        planificateur.objectif_sport_semaine,
+        planificateur.profil_energie,
+    )
+    sauvegarder_projets(planificateur.projets)
     return {"message": f"Projet '{projet.nom}' ajouté.", "etat": planificateur.get_etat()}
 
 
@@ -120,6 +170,7 @@ def supprimer_projet(nom: str):
     planificateur.projets = [p for p in planificateur.projets if p["nom"] != nom]
     if len(planificateur.projets) == avant:
         raise HTTPException(status_code=404, detail=f"Projet '{nom}' introuvable.")
+    sauvegarder_projets(planificateur.projets)
     return {"message": f"Projet '{nom}' supprimé.", "etat": planificateur.get_etat()}
 
 
@@ -132,7 +183,7 @@ def ajouter_creneau(creneau: CreneauFixeConfig):
 
     planificateur.planning_fixe[jour].append((creneau.debut, creneau.duree, creneau.type))
     creneaux_fixes_noms[(jour, creneau.debut)] = creneau.nom
-
+    sauvegarder_creneaux(planificateur.planning_fixe, creneaux_fixes_noms)
     return {"message": f"Créneau '{creneau.nom}' ajouté.", "etat": planificateur.get_etat()}
 
 
@@ -150,6 +201,7 @@ def supprimer_creneau(jour: int, debut: int):
         raise HTTPException(status_code=404, detail="Créneau introuvable.")
 
     creneaux_fixes_noms.pop((jour, debut), None)
+    sauvegarder_creneaux(planificateur.planning_fixe, creneaux_fixes_noms)
     return {"message": "Créneau supprimé.", "etat": planificateur.get_etat()}
 
 
@@ -175,6 +227,12 @@ def get_creneaux():
 @app.post("/objectif-sport")
 def set_objectif_sport(objectif: int):
     planificateur.objectif_sport_semaine = objectif
+    sauvegarder_etat(
+        planificateur.jour_actuel,
+        planificateur.bilan_sport_semaine,
+        planificateur.objectif_sport_semaine,
+        planificateur.profil_energie,
+    )
     return {"message": f"Objectif sport mis à jour : {objectif} créneaux/semaine"}
 
 
@@ -189,7 +247,6 @@ def nouvelle_journee():
     if not taches_jour:
         return {"jour": jour + 1, "message": "Tous les projets sont terminés !", "planning": []}
 
-    # Remplacer projet_id "fixe" par le vrai nom du créneau
     jour_semaine = jour % 7
     for t in taches_jour:
         if t["est_fixee"]:
@@ -226,7 +283,11 @@ def nouvelle_journee():
             "reward":    round(reward, 3),
         })
 
-    plannings_du_mois[jour] = {"taches_placees": env.taches_placees, "env": env}
+    plannings_du_mois[jour] = {
+        "taches_placees": env.taches_placees,
+        "env": EnvSnapshot(env.taches_placees, env.historique_obs),
+    }
+    sauvegarder_planning(jour, env.taches_placees, env.historique_obs)
 
     return {
         "jour":           jour + 1,
@@ -254,6 +315,8 @@ def feedback_soir(feedback: FeedbackSoir):
             agent.rlhf(env, feedback.note_rlhf)
             rlhf_applique = True
 
+    _sauvegarder_tout()
+
     return {
         "jour":          jour + 1,
         "rlhf_applique": rlhf_applique,
@@ -277,7 +340,6 @@ def dashboard():
         for j in sorted(plannings_du_mois)
     ]
 
-    # Créneaux fixes formatés
     creneaux_list = []
     jours_noms = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
     for jour, liste in planificateur.planning_fixe.items():
@@ -313,5 +375,6 @@ def dashboard():
 
 @app.post("/reset")
 def reset():
+    reset_db()
     init_planificateur()
     return {"message": "Nouveau mois démarré !", "etat": planificateur.get_etat()}

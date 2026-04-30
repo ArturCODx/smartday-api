@@ -4,3 +4,5 @@ pydantic
 torch==2.11.0
 numpy
 gymnasium
+sqlalchemy
+psycopg2-binary
