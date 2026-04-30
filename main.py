@@ -133,6 +133,35 @@ def racine():
     }
 
 
+@app.get("/sante")
+def sante():
+    from smartday.database import engine
+    import os
+    db_url = os.getenv("DATABASE_URL", "")
+    db_url_present = bool(db_url)
+    engine_ok = engine is not None
+
+    db_connectee = False
+    erreur = None
+    if engine_ok:
+        try:
+            from sqlalchemy import text
+            from sqlalchemy.orm import Session
+            with Session(engine) as s:
+                s.execute(text("SELECT 1"))
+            db_connectee = True
+        except Exception as e:
+            erreur = str(e)
+
+    return {
+        "database_url_presente": db_url_present,
+        "engine_cree":           engine_ok,
+        "connexion_ok":          db_connectee,
+        "erreur":                erreur,
+        "nb_projets_memoire":    len(planificateur.projets) if planificateur else 0,
+    }
+
+
 @app.get("/etat")
 def get_etat():
     return planificateur.get_etat()
